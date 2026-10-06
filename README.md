@@ -71,6 +71,7 @@ python -m pytest tests/ -q
 | GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致，含公开时间、撤回状态） |
 | GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因（未到公开时间 404） |
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG（未到公开时间 404） |
+| POST | `/documents/{doc_id}/coverage-diff` | **重发前遮盖范围比较**（只读）：当前标注修订号 + 基准发布版本号 → 新增/失去遮盖像素数、占旋正后图像比例、失去遮盖水平段 |
 | POST | `/publication-packages` | **离线交付包**：按请求顺序提交 2～20 个互不重复的 `(doc_id, version)`，成功返回 ZIP（各版 PNG + `manifest.json` 清单）；任一项未知/未到公开时间/已撤回即整包拒绝 |
 
 ## 调用示例（curl）
@@ -117,12 +118,74 @@ curl -s $BASE/publications/$DOC_ID/1           # 410 publication_withdrawn
 curl -s $BASE/documents/$DOC_ID/publications   # v1 条目 withdrawn=true
 ```
 
+重发影像前，先比较**当前标注**与**指定已发布版本**的遮盖范围（纯只读，
+不产生新版本、不改任何记录；基准取该版本发布时冻结的标注）：
+
+```bash
+# 请求：当前标注修订号（乐观锁，过期 409）+ 基准发布版本号
+curl -s -X POST $BASE/documents/$DOC_ID/coverage-diff \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":3,"baseline_version":1}'
+# -> 200
+# {"doc_id":"...","current_revision":3,"baseline_version":1,
+#  "baseline_annotation_revision":1,"width":64,"height":48,
+#  "total_pixels":3072,
+#  "added_pixels":160,"added_ratio":0.052083333333333336,
+#  "lost_pixels":96,"lost_ratio":0.03125,
+#  "lost_segments":[{"y0":8,"y1":20,"intervals":[{"x0":8,"x1":16}]}]}
+# 基准不可见时不泄露其遮盖详情：未知版本 404 unknown_version、
+# 未到公开时间 404 publication_not_yet_public、已撤回 410 publication_withdrawn
+```
+
 完整可运行脚本：`examples/demo.sh`（单份流程）、`examples/demo_batch.sh`
 （批次发布流程）、`examples/demo_idempotency.sh`（批次幂等键流程）、
 `examples/demo_scheduled_publication.sh`（定时公开流程）、
-`examples/demo_withdrawal.sh`（版本撤回流程）与
-`examples/demo_migration.sh`（遮盖方案迁移流程）；
+`examples/demo_withdrawal.sh`（版本撤回流程）、
+`examples/demo_migration.sh`（遮盖方案迁移流程）与
+`examples/demo_coverage_diff.sh`（重发前遮盖范围比较流程）；
 先启动服务，再执行 `bash examples/demo_scheduled_publication.sh`。
+
+## 重发前遮盖范围比较（同一读取快照，纯只读）
+
+档案员重发影像前，需要确认**当前标注**相对某个**已发布版本**多遮了什么、
+漏遮了什么。调用 `POST /documents/{doc_id}/coverage-diff`，请求体携带
+**当前标注修订号**与**基准发布版本号**：
+
+```json
+{"revision": 3, "baseline_version": 1}
+```
+
+- **比较口径**：两套矩形都在 **EXIF 旋正后的像素坐标系**上，按**半开像素
+  区间** `[x, x+w) × [y, y+h)` 处理。**重叠矩形的同一像素只计一次**；
+  **边界相接不算重叠**（如 `[0,10)` 与 `[10,20)` 不共享任何像素）。
+  新增遮盖 = 当前像素并集 − 基准并集；失去遮盖 = 基准并集 − 当前并集。
+- **返回内容**（`200`）：`added_pixels`/`lost_pixels`（像素数）、
+  `added_ratio`/`lost_ratio`（各自占**旋正后图像总像素**
+  `width*height` 的比例）、`total_pixels`，以及按**水平边界段**列出的
+  失去遮盖区间 `lost_segments`：每段为像素行区间 `{"y0","y1"}`
+  （半开 `[y0, y1)`），段内 `intervals` 按 x 升序列出失去遮盖的像素列
+  区间 `{"x0","x1"}`（半开 `[x0, x1)`）。**相邻段的区间列表完全相同时
+  合并为一段**，区间不同（哪怕只差一列）则不合并；没有失去遮盖的段不输出。
+  另附 `baseline_annotation_revision` 标明基准实际冻结的标注修订。
+- **基准必须是发布时冻结的标注**：基准矩形取自发布行固化的
+  `annotation_revision`，历史修订矩形按 `(doc_id, revision)` 追加存储、
+  永不改写——因此发布之后的任何标注修改、迁移或新发布都**不影响**本次
+  比较结果；响应不含矩形原因，只报告像素集合差异。
+- **同一读取快照**：文档、基准发布记录、撤回/公开时间与两套矩形全部在
+  **同一个只读快照事务**（延迟 `BEGIN` 的 WAL 读快照）中读取，比较进行中
+  并发提交的标注修改/发布/撤回不会让两边读到不一致状态。比较**纯只读**：
+  不获取写锁、不生成版本、不写任何改动记录，可安全重复调用。
+- **拒绝且不泄露基准遮盖详情**（沿用统一错误体与既有错误码，顺序与公开
+  读取一致）：未知文档 `404 document_not_found`；基准版本不存在
+  `404 unknown_version`；基准**未到公开时间** `404
+  publication_not_yet_public`（与"版本不存在"同形态）；基准**已撤回**
+  `410 publication_withdrawn`（撤回优先于公开时间，时间到达也不比）；
+  提交的当前修订号不等于服务端当前修订号时 `409 stale_revision`（附
+  `current_revision`/`supplied_revision`，重新拉取修订号后重试）。以上
+  拒绝响应都不携带基准遮盖坐标、区间、摘要或撤回原因。
+
+端到端示例（含新增/失去计算、区间合并及各类拒绝）：
+`bash examples/demo_coverage_diff.sh`。
 
 ## 遮盖方案迁移（同版式、不同尺寸，整批原子）
 
@@ -526,7 +589,7 @@ manifest.json
 | 410 | `publication_withdrawn` | 公开读取已撤回的版本（不返回成品与遮盖详情） |
 | 400 | `invalid_batch_size` | 批次文档数不在 2～20（附 `count`） |
 | 400 | `duplicate_document_in_batch` | 批次内文档 ID 重复（附 `position`/`doc_id`） |
-| 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次/迁移场景另附 `position`/`doc_id`/`supplied_revision`，迁移源侧附 `doc_id`） |
+| 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次/迁移场景另附 `position`/`doc_id`/`supplied_revision`，迁移源侧附 `doc_id`；遮盖范围比较附 `current_revision`/`supplied_revision`） |
 | 409 | `idempotency_key_conflict` | 幂等键已用于不同内容的批次请求（原批次不受影响） |
 | 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
 | 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
@@ -569,6 +632,17 @@ manifest.json
   并发同键请求被写锁串行化，最多发布一次。
 - **不可变性**：标注矩形按 `(doc_id, revision)` 追加存储、历史修订永不改写；
   发布版 PNG 落盘后不改动，后续标注变化不影响已发布成品（批次产物同样如此）。
+- **遮盖范围比较**：`POST /documents/{id}/coverage-diff` 全程在**一个只读
+  快照事务**（延迟 `BEGIN`，首条 SELECT 建立 WAL 读快照）中读取文档、当前
+  修订矩形与基准发布行固化修订（`publications.annotation_revision`）下的
+  冻结矩形——比较期间并发提交的标注修改/发布/撤回对本次读取不可见，两边
+  必然来自同一快照；事务纯只读、不持写锁、不产生版本或任何改动记录。像素
+  集合以半开整数区间（`[x,x+w)×[y,y+h)`）计算：先按两套矩形的全部水平边
+  切出水平条带，条带内分别求 x 区间并集再做集合差，因此**重叠像素只计一次、
+  边界相接（共享零像素）不算重叠**；失去遮盖区间按水平段输出，相邻段区间
+  列表完全相同才合并。基准版本与公开读取同门控（撤回 410 优先、未到公开
+  时间 404、未知版本 404），门控未通过前不读取冻结矩形，拒绝时不泄露基准
+  遮盖详情。
 - **版本撤回**：撤回的"校验 → 查重 → 登记"在同一个 `BEGIN IMMEDIATE`
   写事务内完成，与标注修改、单份/批次发布、其他撤回互斥串行；撤回记录按
   `(doc_id, version)` 主键追加、永不改写——重复撤回（含并发）命中主键直接
@@ -604,9 +678,9 @@ manifest.json
 ```
 app/
   main.py     # FastAPI 路由与事务编排
-  db.py       # SQLite 模式与事务助手（WAL + BEGIN IMMEDIATE）
-  imaging.py  # 解码、EXIF 旋正、涂实、去元数据渲染、矩形缩放
-  models.py   # 请求体模型（含批次、迁移请求）
+  db.py       # SQLite 模式与事务助手（WAL + BEGIN IMMEDIATE；只读快照事务）
+  imaging.py  # 解码、EXIF 旋正、涂实、去元数据渲染、矩形缩放、遮盖范围比较
+  models.py   # 请求体模型（含批次、迁移、遮盖比较请求）
   config.py   # 环境变量配置
 tests/test_api.py    # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
 tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、文档缺失/修订过期/
@@ -626,6 +700,11 @@ tests/test_migration.py      # 20 个用例：缩放取整（floor/ceil/独立�
                              #   迁移与修订号 +1、原因与顺序、源与历史/发布版
                              #   不变、数量/重复/源混入目标/缺失/修订过期/源为空
                              #   整批原子失败不推进修订号、迁移与标注发布并发串行
+tests/test_coverage_diff.py  # 31 个用例：新增/失去像素数与占比、零差异、重叠
+                             #   只计一次/相接不算重叠、水平段相邻相同才合并、
+                             #   基准冻结不受后续修改影响、未知/未到点/撤回不
+                             #   泄露详情、修订过期、纯只读、并发标注下同一快照、
+                             #   纯几何区间并集/相减
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
@@ -633,10 +712,33 @@ examples/demo_scheduled_publication.sh  # 定时公开端到端 curl 示例
 examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 examples/demo_package.sh     # 离线交付包端到端 curl 示例
 examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
+examples/demo_coverage_diff.sh  # 重发前遮盖范围比较端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（遮盖方案迁移）
+## 本轮变动（重发前遮盖范围比较）
+
+- 新增 `POST /documents/{doc_id}/coverage-diff`：请求体
+  `{"revision","baseline_version"}` 携带**当前标注修订号**与**基准发布
+  版本号**；在**同一个只读快照事务**中返回新增/失去遮盖像素数、各自占
+  旋正后图像（`width*height`）的比例，以及按水平边界段列出的失去遮盖
+  区间（相邻段区间完全相同才合并）。像素按半开整数区间计算：**重叠矩形
+  只计一次、边界相接不算重叠**。
+- **基准取发布时冻结的标注**（发布行 `annotation_revision` 指向的历史
+  修订矩形，追加永不改写），不受后续标注修改影响；比较**纯只读**——不生成
+  版本、不写任何改动记录、不持写锁，可重复调用。
+- 拒绝沿用统一错误体与既有错误码，且不泄露基准遮盖详情：未知文档
+  `document_not_found`（404）、未知版本 `unknown_version`（404）、未到
+  公开时间 `publication_not_yet_public`（404）、已撤回
+  `publication_withdrawn`（410，撤回优先于公开时间）、当前修订号过期
+  `stale_revision`（409，附 `current_revision`/`supplied_revision`）。
+- 纯几何逻辑位于 `app/imaging.py::coverage_diff`（全整数运算，含区间
+  并集/相减/水平段合并）；只读快照助手为 `app/db.py::snapshot_tx`。
+  **不新增任何数据表或列**，上传、标注、发布（含定时公开）、批次与幂等键、
+  撤回、公开读取、离线交付包的路由、请求/响应字段及启动方式
+  （Docker Compose / uvicorn）全部保持兼容。
+
+## 历史变动（遮盖方案迁移）
 
 - 新增 `POST /annotation-migrations`：请求体
   `{"source_doc_id","source_revision","targets":[{"doc_id","expected_revision"},…]}`

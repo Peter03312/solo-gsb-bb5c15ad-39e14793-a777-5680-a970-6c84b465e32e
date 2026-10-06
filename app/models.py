@@ -88,3 +88,17 @@ class PackageRequest(BaseModel):
     """
 
     items: list[PackageItem] = Field(default_factory=list)
+
+
+class CoverageDiffRequest(BaseModel):
+    """重发影像前的遮盖范围比较请求（纯只读）。
+
+    携带调用方持有的**当前标注修订号**与作为比较基准的**已发布版本号**：
+    修订号必须等于服务端当前修订号（过期即 409 stale_revision），基准版本
+    必须存在、未撤回且已到公开时间（否则按公开读取同形态拒绝，且不泄露该
+    版本的遮盖详情）。基准矩形取自该版本发布时冻结的标注修订，随后的标注
+    修改不影响比较结果。
+    """
+
+    revision: int = Field(ge=0)
+    baseline_version: int = Field(ge=1)

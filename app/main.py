@@ -15,11 +15,12 @@ from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadF
 from fastapi.responses import FileResponse, Response
 
 from .config import Settings
-from .db import init_db, read_tx, write_tx
+from .db import init_db, read_tx, snapshot_tx, write_tx
 from .imaging import (
     SUPPORTED_FORMATS,
     ImageDecodeError,
     UnsupportedFormatError,
+    coverage_diff,
     load_oriented,
     render_publication,
     scale_rect,
@@ -27,6 +28,7 @@ from .imaging import (
 from .models import (
     AnnotationsPut,
     BatchPublishRequest,
+    CoverageDiffRequest,
     MigrationRequest,
     PackageRequest,
     PublishRequest,
@@ -41,6 +43,11 @@ MAX_PUBLISH_DELAY = timedelta(days=30)
 # 离线交付包"资格确认完毕（仍在写锁/写事务内）-> 读盘打包"之间的钩子。
 # 生产中为空操作；并发测试借此在资格确认后插入撤回，验证串行顺序。
 PACKAGE_ELIGIBILITY_HOOK: Any = None
+
+# 遮盖范围比较"当前修订号校验完毕（读快照已建立）-> 读取矩形并比较"之间
+# 的钩子。生产中为空操作；并发测试借此在同一只读快照事务内、矩形读取之前
+# 提交标注修改，验证比较全程使用同一读取快照（不看到提交后的新标注）。
+COVERAGE_DIFF_SNAPSHOT_HOOK: Any = None
 
 
 def _utcnow() -> str:
@@ -647,6 +654,82 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "source_revision": source["annotation_revision"],
             "count": len(result_targets),
             "targets": result_targets,  # 顺序与请求一致
+        }
+
+    # ---------------- 重发前遮盖范围比较（纯只读，同一读取快照） ----------------
+
+    @app.post("/documents/{doc_id}/coverage-diff")
+    def compare_coverage(doc_id: str, body: CoverageDiffRequest) -> dict:
+        """比较当前标注与指定已发布版本（基准）的遮盖像素集合。
+
+        纯只读：不生成版本、不写任何改动记录。文档、当前修订矩形与基准
+        发布冻结的矩形都在**同一个只读快照事务**（``snapshot_tx``）中读取，
+        因此比较期间发生的标注修改/发布/撤回不会让两边读到不一致的状态；
+        只读事务不获取写锁，不阻塞任何写入。
+
+        拒绝顺序与公开读取一致，且拒绝时不返回任何基准遮盖详情：
+        未知文档 404 document_not_found；未知版本 404 unknown_version；
+        已撤回 410 publication_withdrawn（优先）；未到公开时间 404
+        publication_not_yet_public；当前修订号过期 409 stale_revision。
+        基准矩形取自发布行固化的 annotation_revision——历史修订按
+        (doc_id, revision) 追加永不改写，故不受后续标注修改影响。
+        """
+        # 文档、基准发布行、撤回/公开时间、当前修订与两套矩形全部在同一
+        # 只读快照中读取（延迟 BEGIN 以首条 SELECT 建立 WAL 读快照）。
+        with snapshot_tx(settings.db_path) as conn:
+            doc = _get_doc(conn, doc_id)
+            pub = _get_publication(conn, doc_id, body.baseline_version)
+            # 与公开读取相同的门控顺序：撤回优先（410），未到公开时间 404；
+            # 门控未通过前不读取、不泄露该版本冻结的遮盖矩形。
+            _ensure_not_withdrawn(conn, doc_id, body.baseline_version)
+            _ensure_publish_time_reached(pub)
+            current_revision = doc["annotation_revision"]
+            if body.revision != current_revision:
+                _error(
+                    409,
+                    "stale_revision",
+                    f"annotation revision mismatch: expected {current_revision},"
+                    f" got {body.revision}; re-fetch and retry",
+                    current_revision=current_revision,
+                    supplied_revision=body.revision,
+                )
+
+            # 测试钩子：当前修订已校验、快照已建立，但矩形尚未读取。
+            if COVERAGE_DIFF_SNAPSHOT_HOOK is not None:
+                COVERAGE_DIFF_SNAPSHOT_HOOK()
+
+            current_rows = conn.execute(
+                "SELECT x, y, w, h, reason FROM annotation_rects"
+                " WHERE doc_id = ? AND revision = ? ORDER BY idx",
+                (doc_id, current_revision),
+            ).fetchall()
+            # 基准必须是发布时冻结的标注：取发布行固化的修订号，
+            # 该修订矩形追加存储、永不改写，后续标注变化不影响它。
+            baseline_rows = conn.execute(
+                "SELECT x, y, w, h, reason FROM annotation_rects"
+                " WHERE doc_id = ? AND revision = ? ORDER BY idx",
+                (doc_id, pub["annotation_revision"]),
+            ).fetchall()
+
+            diff = coverage_diff(
+                current_rows, baseline_rows, doc["width"], doc["height"]
+            )
+
+        width, height = doc["width"], doc["height"]
+        total = width * height  # 旋正后图像总像素数
+        return {
+            "doc_id": doc_id,
+            "current_revision": current_revision,
+            "baseline_version": pub["version"],
+            "baseline_annotation_revision": pub["annotation_revision"],
+            "width": width,
+            "height": height,
+            "total_pixels": total,
+            "added_pixels": diff["added_pixels"],
+            "added_ratio": diff["added_pixels"] / total,
+            "lost_pixels": diff["lost_pixels"],
+            "lost_ratio": diff["lost_pixels"] / total,
+            "lost_segments": diff["lost_segments"],
         }
 
     # ---------------- 发布 ----------------

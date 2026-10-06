@@ -20,6 +20,10 @@
   在发布事务内一并固化：成品与版本号在发布当下就生成/占用，"未到点"仅是
   公开读取时按当前 UTC 时间做的判定，到点无需任何补操作；列为 NULL 即立即
   公开。失败事务回滚时该列随记录一并消失，不留下定时版本。
+- 只读快照事务（snapshot_tx）供遮盖范围比较使用：延迟 ``BEGIN`` 后的
+  第一条 SELECT 建立 WAL 读快照，事务内对文档、当前修订标注与基准发布
+  冻结标注的读取全部落在同一快照上，与并发写入互不干扰；事务纯只读，
+  不产生版本、不写入任何改动记录。
 """
 from __future__ import annotations
 
@@ -139,6 +143,28 @@ def read_tx(db_path: str) -> Iterator[sqlite3.Connection]:
     conn = connect(db_path)
     try:
         yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def snapshot_tx(db_path: str) -> Iterator[sqlite3.Connection]:
+    """只读快照事务：事务内全部 SELECT 共享同一个一致性快照。
+
+    SQLite 的延迟事务（``BEGIN``）以第一条读语句开始，WAL 下该读快照在
+    整个事务内保持不变，因此随后提交的写入（标注修改、发布、撤回等）
+    对本事务内后续读取都不可见——遮盖范围比较需要在**同一读取快照**中
+    同时读取文档、当前修订标注与基准发布冻结的标注，本助手保证三者一致。
+    比较纯只读：不获取写锁、不阻塞任何写入，也绝不产生版本或改动记录。
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN")
+        yield conn
+        conn.rollback()  # 只读事务：仅结束快照，没有任何待提交的改动
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
