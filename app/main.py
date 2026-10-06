@@ -15,7 +15,8 @@ from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadF
 from fastapi.responses import FileResponse, Response
 
 from .config import Settings
-from .db import init_db, read_tx, write_tx
+from .coverage import coverage_diff
+from .db import init_db, read_tx, snapshot_tx, write_tx
 from .imaging import (
     SUPPORTED_FORMATS,
     ImageDecodeError,
@@ -27,6 +28,7 @@ from .imaging import (
 from .models import (
     AnnotationsPut,
     BatchPublishRequest,
+    CoverageComparisonRequest,
     MigrationRequest,
     PackageRequest,
     PublishRequest,
@@ -41,6 +43,11 @@ MAX_PUBLISH_DELAY = timedelta(days=30)
 # 离线交付包"资格确认完毕（仍在写锁/写事务内）-> 读盘打包"之间的钩子。
 # 生产中为空操作；并发测试借此在资格确认后插入撤回，验证串行顺序。
 PACKAGE_ELIGIBILITY_HOOK: Any = None
+
+# 遮盖范围比较"全部资格校验通过（读快照事务内）-> 读取两组矩形"之间的钩子。
+# 生产中为空操作；并发测试借此在快照内插入撤回/标注修改，验证比较的所有
+# 读取确实共享同一读取快照（钩子内的写入在另一连接/事务中提交）。
+COVERAGE_COMPARISON_HOOK: Any = None
 
 
 def _utcnow() -> str:
@@ -759,6 +766,86 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 for p in pubs
             ],
+        }
+
+    # ---------------- 遮盖范围比较（重发影像前，只读，同一读取快照） ----------------
+
+    @app.post("/documents/{doc_id}/coverage-comparison")
+    def compare_coverage(doc_id: str, body: CoverageComparisonRequest) -> dict:
+        """比较当前标注与指定已发布版本（基准）的遮盖范围。
+
+        整个资格校验与两组矩形读取都在**同一个只读快照事务**（``BEGIN``
+        DEFERRED）内完成，所有 SELECT 看到同一时刻的数据；比较为**只读**：
+        不发布、不写任何记录、不推进修订号/版本号、不生成产物。
+
+        基准矩形取自基准版本发布时**冻结**的标注修订
+        （``publications.annotation_revision`` -> 历史追加表
+        ``annotation_rects``），标注矩形按 (doc_id, revision) 追加存储、
+        永不改写，因此基准不受其发布之后任何标注修改的影响。
+
+        拒绝顺序与公开读取一致且在读取任何遮盖矩形之前完成：未知文档
+        404 ``document_not_found``、未知版本 404 ``unknown_version``、
+        已撤回 410 ``publication_withdrawn``（撤回优先）、未到公开时间
+        404 ``publication_not_yet_public``——这些情况都不读取、不泄露基准
+        遮盖详情；最后校验调用方提交的当前修订号仍等于服务端当前修订号，
+        过期返回 409 ``stale_revision``（附 current_revision）。
+        """
+        with snapshot_tx(settings.db_path) as conn:
+            doc = _get_doc(conn, doc_id)
+            pub = _get_publication(conn, doc_id, body.baseline_version)
+            # 与公开读取相同的把关顺序：撤回（410）优先于公开时间（404）；
+            # 两者都在遮盖矩形读取之前，绝不泄露基准遮盖详情。
+            _ensure_not_withdrawn(conn, doc_id, body.baseline_version)
+            _ensure_publish_time_reached(pub)
+
+            current_revision = doc["annotation_revision"]
+            if body.current_revision != current_revision:
+                _error(
+                    409,
+                    "stale_revision",
+                    f"annotation revision mismatch: expected {current_revision},"
+                    f" got {body.current_revision}; re-fetch and retry",
+                    doc_id=doc_id,
+                    current_revision=current_revision,
+                    supplied_revision=body.current_revision,
+                )
+
+            # 资格校验已全部通过（仍在同一读取快照内）：并发测试可在此插入
+            # 其他连接上的提交，验证下列读取仍使用本事务的快照。
+            if COVERAGE_COMPARISON_HOOK is not None:
+                COVERAGE_COMPARISON_HOOK()
+
+            def _fetch_rects(revision: int) -> list[Any]:
+                return conn.execute(
+                    "SELECT x, y, w, h, reason FROM annotation_rects"
+                    " WHERE doc_id = ? AND revision = ? ORDER BY idx",
+                    (doc_id, revision),
+                ).fetchall()
+
+            current_rects = _fetch_rects(current_revision)
+            # 基准：发布时冻结的标注修订（历史修订矩形永不改写）
+            baseline_rects = _fetch_rects(pub["annotation_revision"])
+
+            diff = coverage_diff(current_rects, baseline_rects)
+
+        width, height = doc["width"], doc["height"]
+        total_pixels = width * height
+        return {
+            "doc_id": doc_id,
+            "image_width": width,
+            "image_height": height,
+            "total_pixels": total_pixels,
+            "current_revision": current_revision,
+            "baseline_version": pub["version"],
+            "baseline_annotation_revision": pub["annotation_revision"],
+            # 重叠/被多个矩形覆盖的像素按并集只计一次；边界相接不算重叠。
+            # 比例分母均为旋正后图像总像素 width*height（0~1 的未舍入浮点）。
+            "added_pixels": diff["added_pixels"],
+            "added_ratio": diff["added_pixels"] / total_pixels,
+            "lost_pixels": diff["lost_pixels"],
+            "lost_ratio": diff["lost_pixels"] / total_pixels,
+            # 按水平边界段列出失去遮盖区间；相邻段区间完全相同时已合并。
+            "lost_segments": diff["segments"],
         }
 
     # ---------------- 批次发布（整批原子） ----------------

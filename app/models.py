@@ -88,3 +88,16 @@ class PackageRequest(BaseModel):
     """
 
     items: list[PackageItem] = Field(default_factory=list)
+
+
+class CoverageComparisonRequest(BaseModel):
+    """遮盖范围比较请求（只读）：当前标注修订号 + 基准已发布版本号。
+
+    ``current_revision`` 必须等于服务端**当前**标注修订号（乐观锁，过期
+    即 409，要求调用方先重新获取最新标注再比较）；``baseline_version``
+    必须是该文档已发布、已到公开时间且未撤回的版本，比较所用的基准遮盖
+    取自该版本**发布时冻结**的标注修订，不受后续标注修改影响。
+    """
+
+    current_revision: int = Field(ge=0)
+    baseline_version: int = Field(ge=1)

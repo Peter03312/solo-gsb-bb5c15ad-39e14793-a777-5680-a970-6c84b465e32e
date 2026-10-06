@@ -144,6 +144,27 @@ def read_tx(db_path: str) -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
+def snapshot_tx(db_path: str) -> Iterator[sqlite3.Connection]:
+    """只读快照事务：显式 ``BEGIN``（DEFERRED）后全部读取共享同一快照。
+
+    用于"在同一读取快照中"完成多步核对的只读端点（如遮盖范围比较）：
+    事务期间其他连接的提交（标注修改、发布、撤回等）不影响本事务内
+    后续任何 SELECT 看到的数据。DEFERRED 不获取写锁，提交中的写者不会
+    被本事务阻塞（WAL 下读不阻塞写）；事务结束自动释放，绝不写入。
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN")
+        yield conn
+        conn.rollback()  # 只读：无待提交内容，rollback 仅用于结束事务/释放快照
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
 def write_tx(db_path: str) -> Iterator[sqlite3.Connection]:
     """独占写事务：BEGIN IMMEDIATE 使并发写者串行执行。"""
     conn = connect(db_path)
